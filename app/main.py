@@ -36,7 +36,9 @@ app = FastAPI(title="DocMind")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://my-ai-assistant-frontend.vercel.app"
+        "https://my-ai-assistant-frontend.vercel.app",
+         "http://localhost:8000",
+        "http://127.0.0.1:8000"
     ],
     allow_credentials=True,
     allow_methods=["*"],
