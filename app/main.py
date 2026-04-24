@@ -1,15 +1,6 @@
 """
 DocMind — RAG Document Q&A Backend
-Serves the frontend and exposes endpoints matching index.html exactly:
-  GET  /             → serves index.html
-  GET  /health       → { llm_provider, ollama_online, models }
-  POST /upload       → { document_id, filename, chunk_count }
-  GET  /documents    → [ { document_id, filename, chunk_count }, ... ]
-  DELETE /documents/{id}
-  POST /ask          → { answer, citations: [{text, score, page}] }
-
-Requirements:
-  pip install fastapi uvicorn[standard] chromadb sentence-transformers pypdf httpx python-multipart
+Supports: Anthropic Claude, OpenAI, Ollama (set LLM_PROVIDER env var)
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -32,6 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docmind")
 
 app = FastAPI(title="DocMind")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,15 +32,19 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-# ── Config ────────────────────────────────────────────────────────────────
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "llama3.2")
-EMBED_MODEL     = os.getenv("EMBED_MODEL",     "all-MiniLM-L6-v2")
-CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE",  "200"))  # ~200 words keeps prompts lean
-CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP","20"))
 
-# index.html lives in ../frontend/index.html relative to this file
-# or set FRONTEND_DIR env var to point elsewhere
+# ── Config ────────────────────────────────────────────────────────────────
+LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "anthropic").lower()
+ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_KEY      = os.getenv("OPENAI_API_KEY", "")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+EMBED_MODEL     = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
+CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "200"))
+CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "20"))
+
 _here = Path(__file__).parent
 FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", _here.parent / "frontend"))
 
@@ -59,7 +55,7 @@ embedder = SentenceTransformer(EMBED_MODEL)
 # ── ChromaDB ──────────────────────────────────────────────────────────────
 chroma = chromadb.PersistentClient(path=str(_here / "chroma_db"))
 
-# ── Persistent document registry (survives restarts) ─────────────────────
+# ── Registry ─────────────────────────────────────────────────────────────
 REGISTRY_FILE = _here / "registry.json"
 
 def _load_registry() -> dict:
@@ -85,47 +81,36 @@ def extract_text(filename: str, data: bytes) -> str:
         pages = []
         for i, page in enumerate(reader.pages):
             t = page.extract_text() or ""
-            # prefix each page's text so we can recover page numbers later
             pages.append(f"<<PAGE:{i+1}>>\n{t}")
         return "\n".join(pages)
     return data.decode("utf-8", errors="ignore")
 
 
 def chunk_text(text: str) -> list[dict]:
-    """
-    Returns list of { text, page } dicts.
-    Page is extracted from <<PAGE:N>> markers inserted during PDF extraction.
-    """
     import re
-    # Split into page sections
     parts = re.split(r"<<PAGE:(\d+)>>", text)
-
     chunks = []
-    current_page = None
 
     if len(parts) == 1:
-        # Plain text — no page markers
         words = text.split()
         i = 0
         while i < len(words):
-            chunk = " ".join(words[i : i + CHUNK_SIZE])
+            chunk = " ".join(words[i: i + CHUNK_SIZE])
             if chunk.strip():
                 chunks.append({"text": chunk, "page": None})
             i += CHUNK_SIZE - CHUNK_OVERLAP
         return chunks
 
-    # PDF with page markers: parts = ["", "1", "page1 text", "2", "page2 text", ...]
     for i in range(1, len(parts), 2):
         page_num = int(parts[i])
         page_text = parts[i + 1] if i + 1 < len(parts) else ""
         words = page_text.split()
         j = 0
         while j < len(words):
-            chunk = " ".join(words[j : j + CHUNK_SIZE])
+            chunk = " ".join(words[j: j + CHUNK_SIZE])
             if chunk.strip():
                 chunks.append({"text": chunk, "page": page_num})
             j += CHUNK_SIZE - CHUNK_OVERLAP
-
     return chunks
 
 
@@ -139,28 +124,97 @@ def get_collection(doc_id: str):
     )
 
 
-# ── Serve frontend ────────────────────────────────────────────────────────
+# ── LLM Providers ─────────────────────────────────────────────────────────
+
+async def call_anthropic(system: str, user: str) -> str:
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not set in environment variables.")
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 1024,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            },
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, f"Anthropic error {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        return data["content"][0]["text"]
+
+
+async def call_openai(system: str, user: str) -> str:
+    if not OPENAI_KEY:
+        raise HTTPException(500, "OPENAI_API_KEY not set in environment variables.")
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, f"OpenAI error {r.status_code}: {r.text[:300]}")
+        return r.json()["choices"][0]["message"]["content"]
+
+
+async def call_ollama(system: str, user: str) -> str:
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            },
+        )
+        if r.status_code != 200:
+            raise HTTPException(502, f"Ollama error: {r.text[:300]}")
+        return r.json()["message"]["content"]
+
+
+async def call_llm(system: str, user: str) -> str:
+    if LLM_PROVIDER == "anthropic":
+        return await call_anthropic(system, user)
+    elif LLM_PROVIDER == "openai":
+        return await call_openai(system, user)
+    elif LLM_PROVIDER == "ollama":
+        return await call_ollama(system, user)
+    else:
+        raise HTTPException(500, f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
+
+
+# ── Frontend ──────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
-    """Serve index.html — put it in ../frontend/index.html or set FRONTEND_DIR."""
     html_path = FRONTEND_DIR / "index.html"
     if not html_path.exists():
-        raise HTTPException(
-            404,
-            detail=(
-                f"index.html not found at {html_path}. "
-                "Place your index.html in the frontend/ folder next to backend/, "
-                "or set the FRONTEND_DIR environment variable."
-            )
-        )
+        return HTMLResponse("<h2>Backend is running. Frontend not found.</h2>")
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
-# Serve any static assets the frontend might request (css, js, images)
 @app.get("/favicon.ico")
 async def favicon():
-    # Return empty 204 so browser stops retrying
     from fastapi.responses import Response
     return Response(status_code=204)
 
@@ -169,35 +223,18 @@ async def favicon():
 
 @app.get("/health")
 async def health():
-    """
-    index.html reads: data.llm_provider  → shown in header pill
-    """
-    try:
-        async with httpx.AsyncClient(timeout=4) as client:
-            r = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            models = [m["name"] for m in r.json().get("models", [])]
-        return {
-            "status":       "ok",
-            "ollama_online": True,
-            "llm_provider":  OLLAMA_MODEL,
-            "models":        models,
-        }
-    except Exception as e:
-        return {
-            "status":        "degraded",
-            "ollama_online": False,
-            "llm_provider":  OLLAMA_MODEL,
-            "error":         str(e),
-        }
+    return {
+        "status": "ok",
+        "llm_provider": LLM_PROVIDER,
+        "model": ANTHROPIC_MODEL if LLM_PROVIDER == "anthropic" else OPENAI_MODEL if LLM_PROVIDER == "openai" else OLLAMA_MODEL,
+        "documents_loaded": len(registry),
+    }
 
 
 # ── Upload ────────────────────────────────────────────────────────────────
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    """
-    index.html expects: { document_id, filename, chunk_count }
-    """
     raw = await file.read()
     filename = file.filename or "document"
 
@@ -235,14 +272,12 @@ async def upload(file: UploadFile = File(...)):
     return entry
 
 
-# ── Documents list ────────────────────────────────────────────────────────
+# ── Documents ─────────────────────────────────────────────────────────────
 
 @app.get("/documents")
 async def list_documents():
     return list(registry.values())
 
-
-# ── Delete ────────────────────────────────────────────────────────────────
 
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
@@ -260,20 +295,13 @@ async def delete_document(doc_id: str):
 # ── Ask ───────────────────────────────────────────────────────────────────
 
 class AskRequest(BaseModel):
-    question:    str
+    question: str
     document_id: str
-    top_k:       Optional[int] = 3
+    top_k: Optional[int] = 3
 
 
 @app.post("/ask")
 async def ask(req: AskRequest):
-    """
-    RAG pipeline → answer + citations.
-
-    index.html citation shape: { text, score, page }
-    It also calls renderAnswerWithCitations() which looks for [CHUNK-N] tags,
-    so we instruct the LLM to use that exact notation.
-    """
     if req.document_id not in registry:
         raise HTTPException(404, "Document not found. Upload it first.")
 
@@ -282,11 +310,8 @@ async def ask(req: AskRequest):
     if total_chunks == 0:
         raise HTTPException(400, "No chunks indexed for this document.")
 
-    # Clamp top_k to however many chunks actually exist
     n = min(req.top_k or 3, total_chunks)
-    logger.info(f"Query: doc={req.document_id} chunks={total_chunks} top_k={n} q={req.question!r}")
 
-    # 1. Retrieve
     q_emb = embed([req.question])[0]
     results = col.query(
         query_embeddings=[q_emb],
@@ -298,7 +323,6 @@ async def ask(req: AskRequest):
     metas     = results["metadatas"][0]
     distances = results["distances"][0]
 
-    # 2. Build context + citation list
     context_parts = []
     citations = []
     for i, (chunk, meta, dist) in enumerate(zip(chunks, metas, distances)):
@@ -311,7 +335,6 @@ async def ask(req: AskRequest):
         })
 
     context = "\n\n---\n\n".join(context_parts)
-
     system = "Answer using ONLY the context below. Cite chunks as [CHUNK-N]. Be concise."
     user_msg = (
         f"Context:\n\n{context}\n\n"
@@ -319,133 +342,11 @@ async def ask(req: AskRequest):
         "Answer (use [CHUNK-N] citations):"
     )
 
-    # 3. Call Ollama
-    ollama_url = f"{OLLAMA_BASE_URL}/api/chat"
-    payload = {
-        "model":  OLLAMA_MODEL,
-        "stream": False,
-        "options": {
-                    "temperature": 0.2,
-                    "num_ctx": 2048,       # limit context window
-                    "num_predict": 512,   # limit output tokens
-                },
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user_msg},
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            logger.info(f"Calling Ollama model={OLLAMA_MODEL} url={ollama_url}")
-            r = await client.post(ollama_url, json=payload)
-
-            # Surface the raw Ollama error body before raise_for_status swallows it
-            if r.status_code != 200:
-                body_preview = r.text[:500]
-                logger.error(f"Ollama {r.status_code}: {body_preview}")
-                raise HTTPException(
-                    502,
-                    f"Ollama returned HTTP {r.status_code}. "
-                    f"Make sure the model is pulled: ollama pull {OLLAMA_MODEL}. "
-                    f"Details: {body_preview}"
-                )
-
-            resp_json = r.json()
-            logger.info(f"Ollama response keys: {list(resp_json.keys())}")
-
-            # Handle both /api/chat and /api/generate response shapes
-            if "message" in resp_json:
-                answer = resp_json["message"]["content"]
-            elif "response" in resp_json:
-                answer = resp_json["response"]
-            else:
-                raise HTTPException(
-                    502,
-                    f"Unexpected Ollama response shape: {str(resp_json)[:300]}"
-                )
-
-    except HTTPException:
-        raise   # re-raise our own HTTPExceptions unchanged
-    except httpx.ConnectError:
-        raise HTTPException(
-            503,
-            f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
-            "Is it running? Try: ollama serve"
-        )
-    except httpx.TimeoutException:
-        raise HTTPException(
-            504,
-            f"Ollama timed out after 180s. "
-            "Try a smaller/faster model: ollama pull llama3.2:1b"
-        )
-    except Exception as e:
-        logger.exception("Unexpected error calling Ollama")
-        raise HTTPException(500, f"LLM error: {type(e).__name__}: {e}")
-
+    answer = await call_llm(system, user_msg)
     return {"answer": answer, "citations": citations}
-
-
-# ── Debug endpoints (visit in browser to diagnose) ────────────────────────
-
-@app.get("/debug/ollama")
-async def debug_ollama():
-    """Check Ollama connectivity and list available models."""
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            tags = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            models = [m["name"] for m in tags.json().get("models", [])]
-    except Exception as e:
-        return {"ollama_reachable": False, "error": str(e), "url": OLLAMA_BASE_URL}
-
-    model_ok = any(OLLAMA_MODEL in m for m in models)
-    return {
-        "ollama_reachable": True,
-        "url": OLLAMA_BASE_URL,
-        "configured_model": OLLAMA_MODEL,
-        "model_available": model_ok,
-        "all_models": models,
-        "fix": None if model_ok else f"Run: ollama pull {OLLAMA_MODEL}",
-    }
-
-
-@app.get("/debug/ping-llm")
-async def debug_ping_llm():
-    """Send a tiny prompt to Ollama and return the raw response."""
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "stream": False,
-                    "messages": [{"role": "user", "content": "Reply with the single word: OK"}],
-                },
-            )
-            return {
-                "status_code": r.status_code,
-                "response_keys": list(r.json().keys()) if r.status_code == 200 else None,
-                "raw": r.json(),
-            }
-    except Exception as e:
-        return {"error": type(e).__name__, "detail": str(e)}
-
-
-@app.get("/debug/docs")
-async def debug_docs():
-    """Show all documents currently in the registry + their chunk counts."""
-    result = []
-    for doc_id, meta in registry.items():
-        try:
-            col = get_collection(doc_id)
-            actual_chunks = col.count()
-        except Exception as e:
-            actual_chunks = f"ERROR: {e}"
-        result.append({**meta, "chroma_count": actual_chunks})
-    return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
