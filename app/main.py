@@ -32,15 +32,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docmind")
 
 app = FastAPI(title="DocMind")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
-
-
 # ── Config ────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "llama3.2")
